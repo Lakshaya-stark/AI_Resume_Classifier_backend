@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, Body, HTTPException
 import shutil
 import os
 from utils.parser import extract_text
@@ -7,10 +7,10 @@ from utils.matcher import calculate_match_score
 from db.mongo import candidates_collection  
 from fastapi import Query
 from db.jobs import jobs_collection
-from fastapi import Body
-
 from fastapi.middleware.cors import CORSMiddleware
 from bson import ObjectId
+
+# ================= INIT JOBS =================
 def initialize_jobs():
     default_jobs = [
         {
@@ -18,10 +18,6 @@ def initialize_jobs():
             "description": "Build UI using React, HTML, CSS, JavaScript",
             "skills": ["react", "javascript", "html", "css"]
         },
-
-
-
-        
         {
             "title": "Backend Developer",
             "description": "Develop APIs using Node.js, Express, MongoDB, SQL",
@@ -51,22 +47,21 @@ def initialize_jobs():
 
     for job in default_jobs:
         jobs_collection.update_one(
-            {"title": job["title"]},  
+            {"title": job["title"]},
             {"$setOnInsert": job},
             upsert=True
         )
 
     print("✅ Jobs ensured")
 
+
 app = FastAPI()
 initialize_jobs()
 
 UPLOAD_DIR = "uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-
-
-
-
+# ================= UPLOAD =================
 @app.post("/upload-resume/")
 def upload_resume(
     file: UploadFile = File(...),
@@ -78,24 +73,20 @@ def upload_resume(
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    # ================= SELECT JOB OR CUSTOM JD =================
+    # JOB OR CUSTOM JD
     if custom_jd:
         job_description = custom_jd
-        job_skills = custom_jd.split()  # fallback
     else:
         job = jobs_collection.find_one({"_id": ObjectId(job_id)})
-
         if not job:
             return {"error": "Invalid job_id"}
-
         job_description = job["description"]
-        job_skills = job["skills"]
 
-    # ================= NLP =================
+    # NLP
     extracted_text = extract_text(file_path)
     skills = extract_skills(extracted_text)
 
-    # ================= SCORING =================
+    # SCORE
     score = calculate_match_score(
         extracted_text,
         job_description,
@@ -120,19 +111,22 @@ def upload_resume(
         "skills": skills,
         "match_score": f"{score}%"
     }
-@app.get("/candidates")
-def get_candidates(job_id: str, min_score: float = 0):
-    candidates = list(
-        candidates_collection.find(
-            {
-                "job_id": job_id,
-                "match_score": {"$gte": min_score}
-            },
-            {"_id": 0}
-        ).sort("match_score", -1)
-    )
-    return candidates
 
+# ================= GET CANDIDATES =================
+@app.get("/candidates")
+def get_candidates(job_id: str = None, min_score: float = 0):
+    query = {"match_score": {"$gte": min_score}}
+
+    if job_id:
+        query["job_id"] = job_id
+
+    candidates = list(
+        candidates_collection.find(query, {"_id": 0})
+        .sort("match_score", -1)
+    )
+
+    return candidates
+# ================= UPDATE STATUS =================
 @app.put("/update-status")
 def update_status(data: dict = Body(...)):
     filename = data.get("filename")
@@ -148,7 +142,25 @@ def update_status(data: dict = Body(...)):
 
     return {"message": "Status updated successfully"}
 
+# ================= DELETE CANDIDATE =================
+@app.delete("/delete-candidate/{filename}")
+def delete_candidate(filename: str):
+    candidate = candidates_collection.find_one({"filename": filename})
 
+    if not candidate:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+
+    # delete file from uploads
+    file_path = candidate.get("file_path")
+    if file_path and os.path.exists(file_path):
+        os.remove(file_path)
+
+    # delete from DB
+    candidates_collection.delete_one({"filename": filename})
+
+    return {"message": "Candidate deleted successfully"}
+
+# ================= JOB ROUTES =================
 @app.post("/jobs")
 def create_job(data: dict = Body(...)):
     job = {
@@ -164,7 +176,6 @@ def create_job(data: dict = Body(...)):
         "job_id": str(result.inserted_id)
     }
 
-
 @app.get("/jobs")
 def get_jobs():
     jobs = list(jobs_collection.find())
@@ -172,7 +183,7 @@ def get_jobs():
         job["_id"] = str(job["_id"])
     return jobs
 
-
+# ================= CORS =================
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
